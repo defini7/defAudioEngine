@@ -27,14 +27,20 @@ private:
 
 int main()
 {
+	// Creating instance of abstract class
 	Example audio;
 
+	// Loading audio in queue and getting it's id
 	int nSample1 = audio.LoadAudioSample("p1elim.wav");
 
+	// Playing sample
 	audio.PlaySample(nSample1);
 
+	// Because audio engine runs on different thread 
+	// we need to check if there are any active (currently playing) samples
 	while (audio.listActiveSamples.size() > 0) {}
 
+	// "Tell" to the engine that we want to stop it
 	audio.DestroyAudio();
 
 	return 0;
