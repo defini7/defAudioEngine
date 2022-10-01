@@ -1,15 +1,57 @@
 #pragma once
 
-#include <Windows.h>
+#if !defined(DEF_PLATFORM_CUSTOM)
+	#if defined(_WIN32)
+		#define DEF_PLATFORM_WINMM
+	#elif defined(__linux__) || defined(__apple__)
+		#define DEF_PLATFORM_SDL2
+	#endif
+#endif
+
+#if defined(DEF_PLATFORM_WINMM)
+	#include <Windows.h>
+	#pragma comment(lib, "winmm.lib")
+
+	#include <atomic>
+	#include <thread>
+	#include <mutex>
+	#include <condition_variable>
+#endif
+
+#if defined(DEF_PLATFORM_SDL2)
+	#include <iostream>
+
+	#if defined(__linux__) || defined(__apple__)
+		#include <SDL2/SDL.h>
+	#else
+		#include <SDL.h>
+	#endif
+
+	#if defined(_WIN32) && !defined(__MINGW32__)
+		#pragma comment(lib, "SDL2.lib")
+		#pragma comment(lib, "SDL2main.lib")
+	#else
+	/*
+	* Link your libraries
+	* with program
+	*/
+	#endif
+
+	#if defined(SDL_MAIN_NEEDED) || !defined(SDL_MAIN_AVAILABLE)
+		#if defined(__linux__) || defined(__apple__)
+			#define main() main(int argc, char** argv)
+		#else
+			#define main() SDL_main(int argc, char** argv)
+		#endif
+	#else
+		#undef main
+		#define main() SDL_main(int argc, char** argv)
+	#endif
+#endif
+
 #include <list>
 #include <vector>
 #include <string>
-#include <atomic>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-
-#pragma comment(lib, "winmm.lib")
 
 namespace def
 {
@@ -18,21 +60,22 @@ namespace def
 	public:
 		AudioEngine()
 		{
-			bAudioThreadActive = CreateAudio();
-
-			fGlobalTime = 0.0f;
+#if defined(DEF_PLATFORM_SDL2)
+			if (SDL_Init(SDL_INIT_AUDIO) < 0)
+				std::cerr << "Can't initialize audio!\n";
+			else
+#endif
+				m_bAudioThreadActive = CreateAudio();
 		}
 
 		struct AudioSample
 		{
 		public:
-			AudioSample()
-			{
+			AudioSample() = default;
 
-			}
-
-			AudioSample(std::string sWavFile)
+			AudioSample(std::string sWavFile, AudioEngine& ae)
 			{
+#if defined(DEF_PLATFORM_WINMM)
 				FILE* f = nullptr;
 				fopen_s(&f, sWavFile.c_str(), "rb");
 				if (f == nullptr)
@@ -91,13 +134,65 @@ namespace def
 
 				fclose(f);
 				bSampleValid = true;
+#elif defined(DEF_PLATFORM_SDL2)
+				uint8_t* wavData;
+				SDL_AudioSpec fileSpec;
+				uint32_t streamLen = 0;
+
+				if (!SDL_LoadWAV(sWavFile.c_str(), &fileSpec, (uint8_t**)&wavData, &streamLen))
+				{
+					std::cerr << "SDL: couldn't load audio file: " << SDL_GetError() << '\n';
+					bSampleValid = false;
+					return;
+				}
+
+				SDL_AudioCVT cvt;
+				if (SDL_BuildAudioCVT(&cvt, fileSpec.format, fileSpec.channels, fileSpec.freq, ae.m_sdlSampleSpec.format, ae.m_sdlSampleSpec.channels, ae.m_sdlSampleSpec.freq) < 0)
+				{
+					std::cerr << "SDL: failed to build cvt: " << SDL_GetError() << '\n';
+					bSampleValid = false;
+					SDL_FreeWAV(wavData);
+					return;
+				}
+
+				cvt.buf = (uint8_t*)malloc(streamLen * cvt.len_mult);
+				cvt.len = streamLen;
+
+				memcpy(cvt.buf, wavData, streamLen);
+
+				SDL_FreeWAV(wavData);
+
+				if (SDL_ConvertAudio(&cvt) < 0)
+				{
+					std::cerr << "SDL: failed to convert audio!: " << SDL_GetError() << '\n';
+					bSampleValid = false;
+					SDL_free(cvt.buf);
+					return;
+				}
+
+				fSample = (float*)cvt.buf;
+				nSamples = cvt.len_cvt / sizeof(float) / ae.m_sdlSpec.channels;
+				bSampleValid = true;
+
+				SDL_free(cvt.buf);
+#endif
 			}
 
+#if defined(DEF_PLATFORM_SDL2)
+			~AudioSample()
+			{
+				SDL_FreeWAV((uint8_t*)fSample);
+			}
+#endif
+
+#if defined(DEF_PLATFORM_WINMM)
 			WAVEFORMATEX wavHeader;
+#endif
 			float* fSample = nullptr;
 			long nSamples = 0;
 			int nChannels = 0;
 			bool bSampleValid = false;
+
 		};
 
 		std::vector<AudioSample> vecAudioSamples;
@@ -114,10 +209,10 @@ namespace def
 		// 16-bit WAVE file @ 44100Hz ONLY
 		unsigned int LoadAudioSample(std::string sWavFile)
 		{
-			if (!bAudioThreadActive)
+			if (!m_bAudioThreadActive)
 				return -1;
 
-			AudioSample a(sWavFile);
+			AudioSample a(sWavFile, *this);
 			if (a.bSampleValid)
 			{
 				vecAudioSamples.push_back(a);
@@ -145,6 +240,7 @@ namespace def
 		bool CreateAudio(unsigned int sample_rate = 44100, unsigned int channels = 1,
 			unsigned int blocks = 8, unsigned int block_samples = 512)
 		{
+#if defined(DEF_PLATFORM_WINMM)
 			nSampleRate = sample_rate;
 			nChannels = channels;
 			nBlockCount = blocks;
@@ -184,25 +280,59 @@ namespace def
 				pWaveHeaders[n].lpData = (LPSTR)(pBlockMemory + (n * nBlockSamples));
 			}
 
-			bAudioThreadActive = true;
+			m_bAudioThreadActive = true;
 			tAudioThread = std::thread(&AudioEngine::AudioThread, this);
 
 			std::unique_lock<std::mutex> lm(muxBlockNotZero);
 			cvBlockNotZero.notify_one();
+#elif defined(DEF_PLATFORM_SDL2)
+			SDL_AudioSpec wanted;
+
+			SDL_zero(wanted);
+
+			wanted.channels = channels;
+			wanted.format = AUDIO_S16;
+			wanted.freq = sample_rate;
+			wanted.samples = blocks;
+			wanted.userdata = this;
+			wanted.callback = forwardCallback;
+
+			SDL_zero(m_sdlSampleSpec);
+
+			m_sdlSampleSpec.channels = channels;
+			m_sdlSampleSpec.format = AUDIO_F32;
+			m_sdlSampleSpec.freq = sample_rate;
+			m_sdlSampleSpec.userdata = this;
+
+			m_sdlAudioDeviceID = SDL_OpenAudioDevice(0, 0, &wanted, &m_sdlSpec, 0);
+
+			if (!m_sdlAudioDeviceID)
+			{
+				std::cout << "Failed to open audio device!\n" << SDL_GetError() << '\n';
+				return false;
+			}
+
+			SDL_PauseAudioDevice(m_sdlAudioDeviceID, 0);
+#endif
 
 			return true;
 		}
 
 		bool DestroyAudio()
 		{
-			bAudioThreadActive = false;
+			m_bAudioThreadActive = false;
 
+#if defined(DEF_PLATFORM_WINMM)
 			if (tAudioThread.joinable())
 				tAudioThread.join();
+#elif defined(DEF_PLATFORM_SDL2)
+			SDL_CloseAudioDevice(m_sdlAudioDeviceID);
+#endif
 
 			return false;
 		}
 
+#if defined(DEF_PLATFORM_WINMM)
 		void waveOutProc(HWAVEOUT hWaveOut, UINT uMsg, DWORD dwParam1, DWORD dwParam2)
 		{
 			if (uMsg != WOM_DONE) return;
@@ -217,7 +347,14 @@ namespace def
 		{
 			((AudioEngine*)dwInstance)->waveOutProc(hWaveOut, uMsg, dwParam1, dwParam2);
 		}
+#elif defined(DEF_PLATFORM_SDL2)
+		static void forwardCallback(void* userdata, uint8_t* byteStream, int len)
+		{
+			static_cast<AudioEngine*>(userdata)->AudioThread(userdata, byteStream, len);
+		}
+#endif
 
+#if defined(DEF_PLATFORM_WINMM)
 		void AudioThread()
 		{
 			float fTimeStep;
@@ -227,7 +364,7 @@ namespace def
 
 			nMaxSample = (short)pow(2, (sizeof(short) * 8) - 1) - 1;
 
-			while (bAudioThreadActive)
+			while (m_bAudioThreadActive)
 			{
 				if (nBlockFree == 0)
 				{
@@ -272,6 +409,37 @@ namespace def
 				nBlockCurrent %= nBlockCount;
 			}
 		}
+#elif defined(DEF_PLATFORM_SDL2)
+		void AudioThread(void* userdata, uint8_t* byteStream, int len)
+		{
+			m_fGlobalTime = 0.0f;
+
+			float fTimeStep = 1.0f / (float)m_sdlSpec.freq;
+			float fMaxSample = float(std::pow(2, (sizeof(short) * 8) - 1) - 1.0);
+			short nPreviousSample = 0;
+
+			memset(byteStream, 0, len);
+			
+			int16_t* buf = (int16_t*)byteStream;
+
+			auto clip = [](float fSample, float fMax)
+			{
+				return (fSample >= 0.0f) ? std::fmin(fSample, fMax) : std::fmax(fSample, -fMax);
+			};
+
+			uint32_t i = 0;
+			for (unsigned int n = 0; n < len / sizeof(int16_t); n += m_sdlSpec.channels)
+			{
+				for (unsigned int c = 0; c < m_sdlSpec.channels; c++)
+				{
+					buf[i] = int16_t(clip(GetMixerOutput(c, fTimeStep * i, fTimeStep), 1.0f) * fMaxSample);
+					i++;
+				}
+
+				m_fGlobalTime += fTimeStep;
+			}
+		}
+#endif
 
 		// Overridden by user if they want to generate sound in real-time
 		virtual float OnUserSoundSample(int nChannel, float fGlobalTime, float fTimeStep)
@@ -291,15 +459,24 @@ namespace def
 
 			for (auto& s : listActiveSamples)
 			{
+#if defined(DEF_PLATFORM_WINMM)
 				s.nSamplePosition += (long)((float)vecAudioSamples[s.nAudioSampleID - 1].wavHeader.nSamplesPerSec * fTimeStep);
-
+#elif defined(DEF_PLATFORM_SDL2)
+				s.nSamplePosition += (long)((float)m_sdlSpec.freq * fTimeStep);
+#endif
 				if (s.nSamplePosition < vecAudioSamples[s.nAudioSampleID - 1].nSamples)
+				{
+#if defined(DEF_PLATFORM_WINMM)
 					fMixerSample += vecAudioSamples[s.nAudioSampleID - 1].fSample[(s.nSamplePosition * vecAudioSamples[s.nAudioSampleID - 1].nChannels) + nChannel];
+#elif defined(DEF_PLATFORM_SDL2)
+					fMixerSample += vecAudioSamples[s.nAudioSampleID - 1].fSample[(s.nSamplePosition * m_sdlSpec.channels) + nChannel];
+#endif
+				}
 				else
 					s.bFinished = true;
 			}
 
-			listActiveSamples.remove_if([&](const sCurrentlyPlayingSample& s) 
+			listActiveSamples.remove_if([&](const sCurrentlyPlayingSample& s)
 				{
 					if (s.bFinished && s.bLoop)
 						PlaySample(s.nAudioSampleID, true);
@@ -313,6 +490,7 @@ namespace def
 		}
 
 	private:
+#if defined(DEF_PLATFORM_WINMM)
 		short* pBlockMemory = nullptr;
 		HWAVEOUT hwDevice = nullptr;
 
@@ -324,11 +502,19 @@ namespace def
 		WAVEHDR* pWaveHeaders;
 
 		std::thread tAudioThread;
-		std::atomic<bool> bAudioThreadActive;
+		std::atomic<bool> m_bAudioThreadActive;
 		std::atomic<unsigned int> nBlockFree;
 		std::condition_variable cvBlockNotZero;
 		std::mutex muxBlockNotZero;
-		std::atomic<float> fGlobalTime;
+		std::atomic<float> fGlobalTime = 0.0f;
+#elif defined(DEF_PLATFORM_SDL2)
+	public:
+		SDL_AudioSpec m_sdlSpec, m_sdlSampleSpec;
+		SDL_AudioDeviceID m_sdlAudioDeviceID;
 
+	private:
+		std::atomic<float> m_fGlobalTime = 0.0f;
+		std::atomic<bool> m_bAudioThreadActive = false;
+#endif
 	};
 }
