@@ -299,7 +299,13 @@ namespace def
 					s.bFinished = true;
 			}
 
-			listActiveSamples.remove_if([](const sCurrentlyPlayingSample& s) {return s.bFinished; });
+			listActiveSamples.remove_if([&](const sCurrentlyPlayingSample& s) 
+				{
+					if (s.bFinished && s.bLoop)
+						PlaySample(s.nAudioSampleID, true);
+
+					return s.bFinished;
+				});
 
 			fMixerSample += OnUserSoundSample(nChannel, fGlobalTime, fTimeStep);
 
